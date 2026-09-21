@@ -6,6 +6,11 @@
 #   bin/transcribe 주간회의.m4a --names SPEAKER_00=이우성 SPEAKER_01=김팀장
 set -eo pipefail
 
+# --help 는 주석 머리말을 그대로 보여 주고 끝낸다. 실제 작업은 하지 않는다.
+case "${1:-}" in
+  -h|--help) sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit 0 ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INBOX="$ROOT/offline/01-inbox"
 TRANS="$ROOT/offline/02-transcripts"

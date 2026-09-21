@@ -5,6 +5,11 @@
 # 전 과정을 돌려 보고 끝나면 임시 폴더를 지운다.
 set -o pipefail
 
+# --help 는 주석 머리말을 그대로 보여 주고 끝낸다. 실제 작업은 하지 않는다.
+case "${1:-}" in
+  -h|--help) sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit 0 ;;
+esac
+
 ORIG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SP="$(mktemp -d)"
 trap 'rm -rf "$SP"' EXIT
@@ -286,6 +291,27 @@ for ref in $(grep -ohE '(^|\$ROOT/|[^/a-zA-Z0-9_.])bin/[a-z_][a-z0-9_-]*(\.py|\.
              | sed -E 's|^.*bin/|bin/|' | grep -v '__pycache__' | sort -u); do
   [ -e "$ref" ] && ok "안내 경로 $ref 가 있다" || no "안내 경로 $ref 가 없다"
 done
+
+echo "[16] --help 는 설명만 보여 주고 끝낸다"
+# --help 를 주면 실제 작업이 돌아가던 문제가 있었다. prefetch 는 10GB 를 받기
+# 시작했고, transcribe 는 전사를 걸었으며, import-iphone 은 --help 를 일수로 읽었다.
+files_before=$(find offline online models -type f 2>/dev/null | sort)
+env_before=$(md5 -q .env 2>/dev/null || echo none)
+for c in meeting setup prefetch transcribe import-iphone selftest live translate set-token meeting_md.py; do
+  name="${c%.py}"
+  out=$(timeout 180 "bin/$c" --help 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    no "$name --help 가 정상 종료한다 (종료코드 $rc)"
+  elif [ -z "$out" ]; then
+    no "$name --help 가 설명을 보여 준다"
+  else
+    ok "$name --help 가 설명만 보여 주고 끝난다"
+  fi
+done
+files_after=$(find offline online models -type f 2>/dev/null | sort)
+env_after=$(md5 -q .env 2>/dev/null || echo none)
+chk "--help 는 파일을 만들지 않는다" "$files_after" "$files_before"
+chk "--help 는 .env 를 고치지 않는다" "$env_after" "$env_before"
 
 echo "[9] .gitignore"
 T="$SP/gitchk"; rm -rf "$T"; mkdir -p "$T"

@@ -95,6 +95,11 @@ def check_access(token):
 
 
 def main():
+    # --help 는 클립보드를 건드리기 전에 가로챈다
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__.strip())
+        return
+
     # --check 는 클립보드를 건드리지 않고 이미 넣어 둔 토큰만 확인한다
     if "--check" in sys.argv:
         tok = token_from_env()

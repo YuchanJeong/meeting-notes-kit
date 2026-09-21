@@ -81,7 +81,17 @@ def to_markdown(blocks, names, title):
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="whisperx 가 만든 전사 JSON 을 화자별 마크다운 회의록으로 바꿉니다.",
+        epilog="""쓰는 법
+  meeting meeting_md offline/02-transcripts/주간회의.json
+  meeting meeting_md offline/02-transcripts/주간회의.json \\
+      -o offline/03-notes/주간회의.md --names SPEAKER_00=이우성 SPEAKER_01=김팀장
+
+  meeting transcribe 가 전사를 마친 뒤 이 변환을 자동으로 수행합니다.
+  화자 이름만 다시 붙일 때는 전사를 되풀이하지 않고 이 명령만 쓰면 몇 초로 끝납니다.""",
+    )
     p.add_argument("json_path", help="whisperx가 만든 JSON 파일")
     p.add_argument(
         "--names",

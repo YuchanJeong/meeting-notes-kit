@@ -34,7 +34,7 @@ describe() {
     set-token)    echo "HuggingFace 토큰 넣기 (화자분리에 필요)" ;;
     setup-audio)  echo "실시간 자막용 소리 장치 만들기" ;;
     live)         echo "실시간 자막. 회의 중 상대방 말을 한국어로" ;;
-    translate)    echo "영어를 한국어로. live 의 번역 단계이며 따로도 쓴다" ;;
+    translate)    echo "영어 글을 한국어로 (예: pbpaste | meeting translate)" ;;
     import-iphone) echo "아이폰 녹음을 offline/01-inbox 로 가져오기" ;;
     transcribe)   echo "녹음을 화자별 회의록으로" ;;
     meeting_md)   echo "전사 JSON 을 회의록 마크다운으로" ;;
@@ -45,6 +45,11 @@ describe() {
 
 # 목록에 이미 적어 둔 명령들. 여기에 없는 것이 bin 에 생기면 아래에서 따로 붙인다.
 KNOWN="live import-iphone transcribe setup prefetch set-token setup-audio translate meeting_md selftest"
+
+# 인자가 없을 때와 --help 는 같은 목록을 보여 준다
+case "${1:-}" in
+  -h|--help) set -- ;;
+esac
 
 if [ $# -eq 0 ]; then
   echo "meeting-notes: ${ROOT/#$HOME/~}"
@@ -73,7 +78,8 @@ if [ $# -eq 0 ]; then
     meeting setup-audio     실시간 자막용 소리 장치 만들기
 
 ■ 그 밖
-    meeting translate       영어를 한국어로. live 의 번역 단계이며 따로도 쓴다
+    meeting translate       영어 글을 한국어로 옮긴다
+                            예: pbpaste | meeting translate
     meeting meeting_md      전사 JSON 을 회의록 마크다운으로
     meeting selftest        스크립트를 고친 뒤 회귀 점검
 TXT

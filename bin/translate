@@ -469,7 +469,23 @@ def save_log(lines, root):
 def main():
     load_env()
 
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "영어를 한국어로 옮깁니다.\n"
+            "표준입력으로 들어온 줄을 문장 단위로 모아 번역해서 내보냅니다."
+        ),
+        epilog="""쓰는 법
+  pbpaste | meeting translate               클립보드에 복사해 둔 영어를 번역
+  cat notes.md | meeting translate          파일을 번역
+  echo "Let's start." | meeting translate   한 문장만
+
+  회의 중 자막이 목적이라면 이 명령이 아니라 meeting live 를 쓰세요.
+  meeting live 는 소리를 전사한 결과를 이 도구로 넘겨 자막을 만듭니다.
+
+번역은 기본적으로 Ollama 로 이 컴퓨터 안에서 돌기 때문에 내용이 밖으로 나가지 않습니다.
+--backend claude 나 claude-cli 를 고르면 그때는 Claude 로 보냅니다.""",
+    )
     p.add_argument(
         "--backend",
         choices=["ollama", "claude-cli", "claude"],

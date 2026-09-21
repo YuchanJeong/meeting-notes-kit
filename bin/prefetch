@@ -5,6 +5,11 @@
 # 각 단계는 실패해도 다음으로 넘어가며, 끝에서 결과를 요약한다.
 set -o pipefail
 
+# --help 는 주석 머리말을 그대로 보여 주고 끝낸다. 실제 작업은 하지 않는다.
+case "${1:-}" in
+  -h|--help) sed -n '2,/^[^#]/p' "$0" | sed -n 's/^# \{0,1\}//p'; exit 0 ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ -d "$HOME/.local/bin" ]; then
   PATH="$PATH:$HOME/.local/bin"

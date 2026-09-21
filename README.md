@@ -163,7 +163,7 @@ meeting selftest           스크립트 회귀 점검
 | `meeting set-token` | HuggingFace 토큰을 클립보드에서 `.env` 로 옮깁니다. |
 | `meeting setup-audio` | 스피커와 BlackHole로 소리를 함께 보내는 장치를 만듭니다. |
 | `meeting live` | 실시간 자막. 회의 중 상대방 말을 한국어로 봅니다. |
-| `meeting translate` | 영어를 한국어로 옮깁니다. `live` 의 번역 단계이며 따로도 씁니다. |
+| `meeting translate` | 영어 글을 한국어로 옮깁니다. 표준입력으로 받으므로 `pbpaste \| meeting translate` 처럼 파이프로 넘겨 씁니다. 회의 중 자막이 목적이라면 `meeting live` 를 쓰세요. |
 | `meeting import-iphone` | 아이폰 음성 메모를 `offline/01-inbox` 로 가져옵니다. |
 | `meeting transcribe` | 녹음을 화자별 회의록으로 만듭니다. 전사와 화자분리를 함께 합니다. |
 | `meeting meeting_md` | 전사 JSON을 화자별 마크다운으로 바꿉니다. |

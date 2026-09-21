@@ -200,7 +200,24 @@ func switchTo(_ predicate: (Device) -> Bool, label: String) {
 // MARK: - 진입점
 
 let args = CommandLine.arguments
-if args.contains("--list") {
+if args.contains("--help") || args.contains("-h") {
+    print("""
+    스피커와 BlackHole 로 소리를 동시에 보내는 출력 장치를 만듭니다.
+    이 장치를 시스템 출력으로 고르면, 상대방 목소리를 들으면서 그 소리를
+    전사기로도 넘길 수 있습니다. meeting live 가 자동으로 바꿔 쓰므로
+    보통은 한 번 만들어 두기만 하면 됩니다.
+
+    쓰는 법
+      meeting setup-audio             만들거나, 이미 있으면 그대로 둔다
+      meeting setup-audio --status    지금 시스템 출력이 무엇인지 본다
+      meeting setup-audio --list      이 맥의 오디오 장치를 훑어본다
+      meeting setup-audio --use       시스템 출력을 이 장치로 바꾼다
+      meeting setup-audio --speaker   시스템 출력을 내장 스피커로 되돌린다
+      meeting setup-audio --remove    만들어 둔 장치를 지운다
+
+    BlackHole 이 먼저 깔려 있어야 합니다: brew install blackhole-2ch
+    """)
+} else if args.contains("--list") {
     listDevices()
 } else if args.contains("--remove") {
     removeDevice()
