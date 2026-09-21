@@ -38,13 +38,14 @@ describe() {
     import-iphone) echo "아이폰 녹음을 offline/01-inbox 로 가져오기" ;;
     transcribe)   echo "녹음을 화자별 회의록으로" ;;
     meeting_md)   echo "전사 JSON 을 회의록 마크다운으로" ;;
+    subtitle)     echo "자막 창. meeting live 가 안에서 띄운다" ;;
     selftest)     echo "스크립트를 고친 뒤 회귀 점검" ;;
     *)            echo "" ;;
   esac
 }
 
 # 목록에 이미 적어 둔 명령들. 여기에 없는 것이 bin 에 생기면 아래에서 따로 붙인다.
-KNOWN="live import-iphone transcribe setup prefetch set-token setup-audio translate meeting_md selftest"
+KNOWN="live import-iphone transcribe setup prefetch set-token setup-audio translate subtitle meeting_md selftest"
 
 # 아직 준비되지 않은 것만 짚어 준다. 무엇부터 해야 하는지가 순서보다 먼저다.
 todo=""
@@ -118,6 +119,7 @@ if [ $# -eq 0 ]; then
 
 그 밖
      meeting translate        영어 글을 한국어로 (예: pbpaste | meeting translate)
+     meeting subtitle         자막 창. meeting live 가 안에서 띄운다
      meeting meeting_md       전사 JSON 을 회의록 마크다운으로
      meeting selftest         스크립트를 고친 뒤 회귀 점검
 TXT

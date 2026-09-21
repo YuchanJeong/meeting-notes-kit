@@ -313,6 +313,24 @@ env_after=$(md5 -q .env 2>/dev/null || echo none)
 chk "--help 는 파일을 만들지 않는다" "$files_after" "$files_before"
 chk "--help 는 .env 를 고치지 않는다" "$env_after" "$env_before"
 
+echo "[17] 자막 창"
+# 창은 '>번호 원문' 과 '=번호 번역' 만 읽는다. 형식이 어긋나면 창에 아무것도 뜨지 않는다.
+out=$(printf 'Hello there.\n' | timeout 180 bin/translate --window --no-translate --no-save 2>/dev/null)
+has "창이 읽는 형식으로 내보낸다" "$out" "=1 Hello there."
+chk "같은 줄을 거듭 보내지 않는다" "$(printf '%s' "$out" | grep -c '^=1 ' | tr -d ' ')" "1"
+[ -f bin/subtitle.swift ] && ok "자막 창 소스가 있다" || no "bin/subtitle.swift 가 없다"
+grep -q 'subtitle.swift' bin/live \
+  && ok "live 가 자막 창을 잇는다" || no "live 가 자막 창을 잇지 않는다"
+grep -qE '^[[:space:]]*--terminal\)' bin/live \
+  && ok "창 대신 터미널로 되돌릴 수 있다" || no "--terminal 이 없다"
+grep -q '^\.build/' .gitignore \
+  && ok "컴파일 결과는 추적하지 않는다" || no ".build 가 .gitignore 에 없다"
+# 두 단계 번역. 작은 모델이 깔려 있지 않은 맥에서도 한 단계로 돌아가야 한다.
+grep -q 'except SystemExit' bin/translate \
+  && ok "작은 모델이 없으면 한 단계로 간다" || no "작은 모델이 없을 때 대비가 없다"
+grep -q 'history=' bin/translate \
+  && ok "다듬을 때 앞뒤 맥락을 넘긴다" || no "맥락을 넘기지 않는다"
+
 echo "[9] .gitignore"
 T="$SP/gitchk"; rm -rf "$T"; mkdir -p "$T"
 cp -R bin online offline .gitignore .env.example CLAUDE.md README.md "$T"/

@@ -6,11 +6,11 @@
 
 - `online/` — 온라인 회의. Anarlog 앱이 전사와 요약까지 처리하므로 스크립트가 없고, 결과 마크다운만 `02-notes/`에 쌓입니다.
 - `offline/` — 현장 회의. `01-inbox`(녹음 원본) → `02-transcripts`(whisperx JSON) → `03-notes`(화자별 마크다운) 순으로 흐릅니다.
-- `bin/` — 진입점 `meeting`, 설치용 `setup`·`prefetch`·`set-token`·`setup-audio.swift`, 실시간 자막용 `live`·`translate`, 회의록용 `import-iphone`·`transcribe`·`meeting_md.py`, 점검용 `selftest`.
+- `bin/` — 진입점 `meeting`, 설치용 `setup`·`prefetch`·`set-token`·`setup-audio.swift`, 실시간 자막용 `live`·`translate`·`subtitle.swift`, 회의록용 `import-iphone`·`transcribe`·`meeting_md.py`, 점검용 `selftest`.
 - `models/` — 실시간 전사용 whisper.cpp 모델. 용량이 커서 git으로 추적하지 않습니다.
 - `examples/` — 결과물 예시. 실제 회의록 대신 공개해도 되는 표본을 둡니다.
 
-실시간 자막과 번역은 `bin/live`와 `bin/translate`로 구현되어 있습니다. `PLAN.md`는 그 구조를 정하기까지의 검토 기록이므로, 왜 전사기와 번역기를 따로 붙였는지 같은 배경을 확인할 때 참고합니다.
+실시간 자막과 번역은 `bin/live`, `bin/translate`, `bin/subtitle.swift`로 구현되어 있습니다. 자막은 터미널이 아니라 떠 있는 창에 쌓이며, 작은 모델로 먼저 옮긴 뒤 큰 모델이 맥락을 보고 같은 줄을 다시 고쳐 씁니다. `PLAN.md`는 그 구조를 정하기까지의 검토 기록이므로, 왜 전사기와 번역기를 따로 붙였는지 같은 배경을 확인할 때 참고합니다.
 
 ## 이 폴더에서 자주 요청받는 일
 

@@ -42,7 +42,7 @@ SYSTEM = """당신은 회의 통역사입니다. 영어 발화를 한국어로 �
 
 규칙:
 - 번역문만 출력합니다. 설명, 따옴표, 원문 병기를 넣지 않습니다.
-- 회의에서 말하듯 자연스러운 구어체로 옮깁니다.
+- 회의에서 말하듯 자연스러운 구어체로 옮기되, 문장은 존댓말로 끝맺습니다.
 - 고유명사, 제품명, 기술 용어는 통용되는 번역어가 없으면 원어를 그대로 둡니다.
 - 문장이 중간에 끊겨 있으면 끊긴 그대로 옮깁니다. 내용을 추측해 채우지 않습니다."""
 
@@ -60,10 +60,17 @@ def load_env():
         os.environ.setdefault(k.strip(), v.strip())
 
 
-def build_prompt(text, context):
+def build_prompt(text, context, history=None):
+    parts = []
     if context:
-        return f"회의 맥락: {context}\n\n다음 영어 발화를 한국어로 옮기세요.\n\n{text}"
-    return f"다음 영어 발화를 한국어로 옮기세요.\n\n{text}"
+        parts.append(f"회의 맥락: {context}")
+    if history:
+        # 앞선 발화와 그 번역을 같이 준다. 용어와 말투가 앞뒤로 흔들리지 않는다.
+        lines = [f"- {en}\n  → {ko}" for en, ko in history if ko]
+        if lines:
+            parts.append("바로 앞에 오간 말입니다. 용어와 말투를 여기에 맞추세요.\n" + "\n".join(lines))
+    parts.append(f"다음 영어 발화를 한국어로 옮기세요.\n\n{text}")
+    return "\n\n".join(parts)
 
 
 class OllamaBackend:
@@ -136,13 +143,13 @@ class OllamaBackend:
         except Exception:
             pass   # 워밍업 실패는 치명적이지 않다. 첫 번역이 느려질 뿐이다.
 
-    def _request(self, text, stream):
+    def _request(self, text, stream, history=None):
         payload = json.dumps(
             {
                 "model": self.model,
                 "keep_alive": "30m",
                 "system": SYSTEM,
-                "prompt": build_prompt(text, self.context),
+                "prompt": build_prompt(text, self.context, history),
                 "stream": stream,
                 "options": {"temperature": 0.2, "num_predict": 200},
             }
@@ -154,8 +161,8 @@ class OllamaBackend:
         )
         return urllib.request.urlopen(req, timeout=120)
 
-    def translate(self, text):
-        with self._request(text, stream=False) as r:
+    def translate(self, text, history=None):
+        with self._request(text, stream=False, history=history) as r:
             return json.loads(r.read().decode()).get("response", "").strip()
 
     def stream_translate(self, text):
@@ -201,7 +208,7 @@ class ClaudeBackend:
     def stream_translate(self, text):
         yield self.translate(text)
 
-    def translate(self, text):
+    def translate(self, text, history=None):
         import anthropic
 
         try:
@@ -210,7 +217,7 @@ class ClaudeBackend:
                 max_tokens=2048,
                 system=SYSTEM,
                 output_config={"effort": "low"},
-                messages=[{"role": "user", "content": build_prompt(text, self.context)}],
+                messages=[{"role": "user", "content": build_prompt(text, self.context, history)}],
             )
         except anthropic.APIStatusError as e:
             return f"[번역 실패 HTTP {e.status_code}] {text}"
@@ -243,7 +250,7 @@ class ClaudeCliBackend:
     def stream_translate(self, text):
         yield self.translate(text)
 
-    def translate(self, text):
+    def translate(self, text, history=None):
         import subprocess
 
         cmd = ["claude", "-p", SYSTEM]
@@ -251,7 +258,7 @@ class ClaudeCliBackend:
             cmd += ["--model", self.cli_model]
         try:
             r = subprocess.run(
-                cmd, input=build_prompt(text, self.context),
+                cmd, input=build_prompt(text, self.context, history),
                 capture_output=True, text=True, timeout=120,
             )
         except subprocess.TimeoutExpired:
@@ -500,6 +507,12 @@ def main():
     p.add_argument("--no-save", action="store_true", help="끝낼 때 자막을 파일로 남기지 않음")
     p.add_argument("--no-translate", action="store_true",
                    help="번역하지 않고 정리된 전사만 내보냄 (한국어 회의 등)")
+    p.add_argument("--window", action="store_true",
+                   help="자막 창이 읽는 형식으로 내보냄 (>번호 원문 / =번호 번역)")
+    p.add_argument("--fast-model", default=None,
+                   help="먼저 훑는 번역에 쓸 작은 모델 (기본: exaone3.5:2.4b)")
+    p.add_argument("--no-refine", action="store_true",
+                   help="맥락을 반영해 다시 다듬는 두 번째 번역을 하지 않음")
     args = p.parse_args()
 
     if args.no_translate:
@@ -512,21 +525,51 @@ def main():
         }
         backend = backends[args.backend](args.model, args.context)
 
+    # 창 모드에서는 지나간 줄도 고칠 수 있다. 작은 모델로 먼저 훑고,
+    # 큰 모델이 앞뒤 맥락까지 보고 같은 자리를 다시 고쳐 쓴다.
+    fast = None
+    if args.window and not args.no_refine and args.backend == "ollama" and backend is not None:
+        try:
+            fast = OllamaBackend(args.fast_model or os.environ.get("OLLAMA_FAST_MODEL",
+                                                                  "exaone3.5:2.4b"), args.context)
+        except SystemExit:
+            fast = None      # 작은 모델이 없으면 한 단계로만 간다
+
     color = not args.plain and sys.stdout.isatty()
     DIM, RESET, BOLD = ("\033[2m", "\033[0m", "\033[1m") if color else ("", "", "")
 
     if backend is None:
         print("전사만 정리해서 내보냅니다 (번역 없음).\n", file=sys.stderr)
     else:
-        print(f"[{args.backend} / {backend.model}] 준비 중…", file=sys.stderr)
+        if fast is not None:
+            print(f"[{args.backend}] {fast.model} 로 먼저 훑고 {backend.model} 로 다듬습니다. 준비 중…",
+                  file=sys.stderr)
+            fast.warmup()
+        else:
+            print(f"[{args.backend} / {backend.model}] 준비 중…", file=sys.stderr)
         backend.warmup()
         print("번역을 시작합니다.\n", file=sys.stderr)
 
     # 원문을 먼저 보여 주고 번역은 뒤따라오게 한다.
     # 한 줄씩 번역을 기다리면 원문까지 함께 늦어져서, 말이 끝난 뒤에야 화면이 움직인다.
     jobs = queue.Queue()
+    refine_jobs = queue.Queue()
     lock = threading.Lock()
     transcript = []      # 끝낼 때 파일로 남기기 위한 기록
+    said = {}            # 번호 -> [원문, 지금까지의 번역]
+    spoken = []          # 맥락으로 넘길 최근 발화 번호
+
+    sent = {}
+
+    def emit(kind, seq, body):
+        """자막 창이 읽는 형식. 같은 번호를 다시 보내면 그 줄이 고쳐진다."""
+        with lock:
+            # 내용이 그대로면 보내지 않는다. 창이 같은 줄을 거듭 다시 그릴 일이 없다.
+            if sent.get((kind, seq)) == body:
+                return
+            sent[(kind, seq)] = body
+            sys.stdout.write(f"{kind}{seq} {body}\n")
+            sys.stdout.flush()
 
     controls = Controls()
     if controls.start():
@@ -539,11 +582,27 @@ def main():
                 break
             seq, text = item
             if backend is None:
-                with lock:
-                    print(text, flush=True)
-                transcript.append((text, ""))
+                if args.window:
+                    # 번역이 없으면 전사가 곧 내용이다. 큰 줄로 올린다.
+                    emit("=", seq, text)
+                    said[seq] = [text, ""]
+                else:
+                    with lock:
+                        print(text, flush=True)
+                    transcript.append((text, ""))
                 jobs.task_done()
                 continue
+            if args.window:
+                # 먼저 빠른 쪽으로 한 번 띄운다. 기다리는 동안 화면이 비지 않는다.
+                first = (fast or backend).translate(text)
+                emit("=", seq, first)
+                said[seq] = [text, first]
+                spoken.append(seq)
+                if fast is not None:
+                    refine_jobs.put(seq)
+                jobs.task_done()
+                continue
+
             collected = []
             with lock:
                 sys.stdout.write(f"{BOLD}→ ")
@@ -557,15 +616,43 @@ def main():
             transcript.append((text, "".join(collected).strip()))
             jobs.task_done()
 
+    def refiner():
+        while True:
+            seq = refine_jobs.get()
+            if seq is None:
+                break
+            try:
+                # 이 발화 앞에 오간 말 몇 개를 맥락으로 넘긴다
+                prev = [said[i] for i in spoken if i < seq][-4:]
+                better = backend.translate(said[seq][0], history=[(a, b) for a, b in prev])
+                if better and better != said[seq][1]:
+                    said[seq][1] = better
+                    emit("=", seq, better)
+            except Exception:
+                pass          # 다듬기가 실패해도 먼저 띄운 번역은 그대로 남는다
+            refine_jobs.task_done()
+
     th = threading.Thread(target=worker, daemon=True)
     th.start()
+    rth = None
+    if fast is not None:
+        rth = threading.Thread(target=refiner, daemon=True)
+        rth.start()
 
     seq = 0
     live_line = {"open": False}
 
+    last_partial = {"text": ""}
+
     def show_partial(text):
         # 자라는 중인 발화는 한 줄에 겹쳐 쓴다. 터미널이 아니면 굳이 지우지 않는다.
         if args.no_source or controls.paused:
+            return
+        if args.window:
+            # 아직 확정 전이므로 다음 번호로 미리 띄운다. 확정되면 같은 번호를 다시 보낸다.
+            # 번역이 없을 때는 전사가 곧 내용이므로 작은 줄에 겹쳐 적지 않는다.
+            last_partial["text"] = text
+            emit("=" if backend is None else ">", seq + 1, text)
             return
         if backend is None and not color:
             return   # 번역이 없고 색도 못 쓰면, 확정된 줄만 내보내면 된다
@@ -593,6 +680,8 @@ def main():
             with lock:
                 close_partial()
             seq += 1
+            if args.window and chunk != last_partial["text"] and backend is not None:
+                emit(">", seq, chunk)   # 겹침을 잘라낸 결과가 다를 때만 고쳐 쓴다
             jobs.put((seq, chunk))
         jobs.join()
     except KeyboardInterrupt:
@@ -601,6 +690,12 @@ def main():
         controls.restore()
         jobs.put(None)
         th.join(timeout=5)
+        if rth is not None:
+            refine_jobs.put(None)
+            rth.join(timeout=20)
+        if args.window:
+            transcript.extend(tuple(said[i]) for i in sorted(said))
+            transcript[:] = [(a, b) for a, b in transcript if a or b]
         if not args.no_save:
             saved = save_log(transcript, ROOT)
             if saved:

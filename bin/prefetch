@@ -119,6 +119,15 @@ else
     done
     [ -n "$got_model" ] || mark_fail "번역 모델 (후보 모두 실패)"
 
+    # 자막 창은 두 단계로 번역한다. 먼저 훑을 작은 모델도 받아 둔다.
+    FAST="${OLLAMA_FAST_MODEL:-exaone3.5:2.4b}"
+    echo "먼저 훑는 작은 모델: $FAST"
+    if ollama pull "$FAST" 2>&1 | tail -2 && ollama list 2>/dev/null | grep -q "${FAST%%:*}"; then
+      mark_ok "빠른 번역 모델 $FAST"
+    else
+      mark_fail "빠른 번역 모델 $FAST (없어도 한 단계로 돌아갑니다)"
+    fi
+
     if [ "$started_here" = "1" ]; then
       echo "띄워 둔 Ollama 서버를 내립니다."
       pkill -f "ollama serve" 2>/dev/null || true
@@ -126,6 +135,22 @@ else
   else
     mark_fail "Ollama 설치"
   fi
+fi
+
+# ---------------------------------------------------------------
+echo
+echo "== 4. 자막 창 =="
+# 회의 직전에 10초를 기다리지 않도록 미리 컴파일해 둔다.
+if command -v swiftc >/dev/null 2>&1; then
+  mkdir -p "$ROOT/.build"
+  if swiftc -O "$ROOT/bin/subtitle.swift" -o "$ROOT/.build/subtitle" 2>/dev/null; then
+    mark_ok "자막 창 컴파일"
+  else
+    mark_fail "자막 창 컴파일"
+  fi
+else
+  echo "swiftc 가 없어 건너뜁니다. Xcode 명령행 도구가 필요합니다."
+  mark_fail "자막 창 (swiftc 없음)"
 fi
 
 # ---------------------------------------------------------------

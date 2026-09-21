@@ -14,3 +14,6 @@ online/02-notes/*
 # 폴더 구조와 작성용 템플릿은 남긴다
 !**/.gitkeep
 !online/02-notes/_template.md
+
+# swift 자막 창을 미리 컴파일해 둔 결과
+.build/
