@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# meeting-notes 의 스크립트를 어느 폴더에서든 실행하는 진입점.
+#
+#   meeting              쓸 수 있는 명령 보기
+#   meeting live         bin/live 실행
+#   meeting transcribe   bin/transcribe 실행
+#
+# bin/setup 이 이 파일을 ~/.local/bin/meeting 으로 이어 준다.
+set -eo pipefail
+
+# 이 파일이 프로젝트 안에 있으므로 자기 위치로 폴더를 찾는다.
+# 다른 곳에 복사해 두었다면 MEETING_NOTES_ROOT 로 알려 준다.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$(dirname "$SELF")/$LINK" ;;
+  esac
+done
+ROOT="${MEETING_NOTES_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+
+if [ ! -d "$ROOT/bin" ]; then
+  echo "프로젝트 폴더를 찾지 못했습니다: $ROOT" >&2
+  echo "다른 곳에 두셨다면 MEETING_NOTES_ROOT 환경변수로 경로를 알려 주세요." >&2
+  exit 1
+fi
+
+# 목록에 붙일 한 줄 설명. 여기에 없는 명령은 이름만 보여 준다.
+describe() {
+  case "$1" in
+    setup)        echo "처음 한 번. 필요한 도구를 깔고 .env 를 만든다" ;;
+    prefetch)     echo "전사와 번역에 쓸 모델을 미리 받아 둔다" ;;
+    set-token)    echo "HuggingFace 토큰을 클립보드에서 .env 로 옮긴다" ;;
+    setup-audio)  echo "스피커와 BlackHole 로 소리를 함께 보내는 장치를 만든다" ;;
+    live)         echo "실시간 자막. 회의 중 상대방 말을 한국어로 본다" ;;
+    translate)    echo "영어를 한국어로. live 의 번역 단계이며 따로도 쓴다" ;;
+    import-iphone) echo "아이폰 음성 메모를 offline/01-inbox 로 가져온다" ;;
+    transcribe)   echo "녹음을 화자별 회의록으로. 전사와 화자분리를 함께 한다" ;;
+    meeting_md)   echo "전사 JSON 을 화자별 마크다운으로 바꾼다" ;;
+    selftest)     echo "스크립트를 고친 뒤 회귀 점검" ;;
+    *)            echo "" ;;
+  esac
+}
+
+# 쓰는 순서대로 묶어서 보여 준다. 알파벳 순으로 늘어놓으면 무엇부터 할지 알기 어렵다.
+GROUP_TITLES="처음 준비:실시간 자막:회의록 만들기:점검"
+GROUP_CMDS="setup prefetch set-token setup-audio:live translate:import-iphone transcribe meeting_md:selftest"
+
+if [ $# -eq 0 ]; then
+  echo "meeting-notes: $ROOT"
+
+  listed=""
+  i=1
+  while [ $i -le 4 ]; do
+    title="$(printf '%s' "$GROUP_TITLES" | cut -d: -f$i)"
+    cmds="$(printf '%s' "$GROUP_CMDS" | cut -d: -f$i)"
+    echo
+    echo "$title"
+    for base in $cmds; do
+      [ -e "$ROOT/bin/$base" ] || [ -e "$ROOT/bin/$base.py" ] || [ -e "$ROOT/bin/$base.swift" ] || continue
+      printf '  meeting %-14s %s\n' "$base" "$(describe "$base")"
+      listed="$listed $base"
+    done
+    i=$((i + 1))
+  done
+
+  # 위 묶음에 없는 명령이 생겼다면 빠뜨리지 않고 뒤에 붙인다.
+  extra=""
+  for f in "$ROOT"/bin/*; do
+    [ -d "$f" ] && continue
+    base="$(basename "$f")"; base="${base%.py}"; base="${base%.swift}"
+    case "$base" in whisperx_safe|meeting) continue ;; esac
+    case " $listed " in *" $base "*) continue ;; esac
+    extra="$extra $base"
+  done
+  if [ -n "$extra" ]; then
+    echo
+    echo "그 밖"
+    for base in $extra; do
+      printf '  meeting %-14s %s\n' "$base" "$(describe "$base")"
+    done
+  fi
+
+  echo
+  echo "각 명령의 자세한 사용법:  meeting <명령> --help"
+  echo "폴더로 이동하려면:        cd $ROOT"
+  exit 0
+fi
+
+cmd="$1"; shift
+# meeting_md 는 파일명에 확장자가 있어 그대로도, 빼고도 받는다
+for candidate in "$ROOT/bin/$cmd" "$ROOT/bin/$cmd.py"; do
+  if [ -x "$candidate" ]; then
+    cd "$ROOT"
+    exec "$candidate" "$@"
+  fi
+done
+
+# swift 스크립트는 실행 권한 대신 swift 로 태운다
+if [ -f "$ROOT/bin/$cmd.swift" ]; then
+  cd "$ROOT"
+  exec swift "$ROOT/bin/$cmd.swift" "$@"
+fi
+
+echo "그런 명령이 없습니다: $cmd" >&2
+echo "쓸 수 있는 명령을 보려면 인자 없이 'meeting' 을 실행하세요." >&2
+exit 1

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# 모델과 실시간 도구를 미리 받아 둔다.
+#
+# 회의 직전이나 첫 전사 때 수 GB를 기다리지 않기 위한 준비 작업이다.
+# 각 단계는 실패해도 다음으로 넘어가며, 끝에서 결과를 요약한다.
+set -o pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -d "$HOME/.local/bin" ]; then
+  PATH="$PATH:$HOME/.local/bin"
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+done_list=""
+fail_list=""
+mark_ok()   { done_list="$done_list\n  [완료] $1"; }
+mark_fail() { fail_list="$fail_list\n  [실패] $1"; }
+
+echo "=============================================="
+echo " 사전 준비 시작: $(date '+%Y-%m-%d %H:%M')"
+echo "=============================================="
+
+# ---------------------------------------------------------------
+echo
+echo "== 1. 사후 처리용 전사 모델 =="
+# 3초짜리 무음을 한 번 전사시켜서 모델을 캐시에 내려받는다.
+# 화자분리는 토큰이 필요하므로 여기서는 켜지 않는다.
+if command -v whisperx >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
+  MODEL="${WHISPER_MODEL:-large-v3}"
+  echo "모델 내려받는 중: $MODEL (수 GB, 몇 분 걸립니다)"
+  ffmpeg -f lavfi -i anullsrc=r=16000:cl=mono -t 3 -y "$TMP/silence.wav" >/dev/null 2>&1
+  if whisperx "$TMP/silence.wav" --model "$MODEL" --language ko --compute_type int8 \
+       --output_format json --output_dir "$TMP" >/dev/null 2>&1; then
+    mark_ok "전사 모델 $MODEL"
+  else
+    mark_fail "전사 모델 $MODEL"
+  fi
+else
+  echo "whisperx 또는 ffmpeg가 없어 건너뜁니다. bin/setup 을 먼저 실행하세요."
+  mark_fail "전사 모델 (whisperx 없음)"
+fi
+
+# ---------------------------------------------------------------
+echo
+echo "== 2. 실시간 전사용 whisper.cpp =="
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew가 없어 건너뜁니다."
+  mark_fail "whisper.cpp (brew 없음)"
+else
+  if brew list whisper-cpp >/dev/null 2>&1 || brew install whisper-cpp; then
+    mark_ok "whisper.cpp 설치"
+  else
+    mark_fail "whisper.cpp 설치"
+  fi
+
+  # 실시간에서는 지연이 먼저이므로 작은 영어 전용 모델을 쓴다.
+  MODEL_DIR="$ROOT/models"
+  mkdir -p "$MODEL_DIR"
+  BASE_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+  for m in ggml-small.en.bin ggml-medium.en.bin ggml-small.bin; do
+    if [ -s "$MODEL_DIR/$m" ]; then
+      echo "이미 있음: $m"
+      mark_ok "실시간 모델 $m (기존)"
+      continue
+    fi
+    echo "내려받는 중: $m"
+    # 임시 이름으로 받고 다 받은 뒤에 옮긴다.
+    # 제자리에 바로 받으면, 받는 도중에 bin/live 가 그 파일을 온전한 것으로 보고 읽는다.
+    if curl -fL --retry 2 -o "$MODEL_DIR/$m.part" "$BASE_URL/$m"; then
+      mv "$MODEL_DIR/$m.part" "$MODEL_DIR/$m"
+      mark_ok "실시간 모델 $m"
+    else
+      rm -f "$MODEL_DIR/$m.part"
+      mark_fail "실시간 모델 $m"
+    fi
+  done
+fi
+
+# ---------------------------------------------------------------
+echo
+echo "== 3. 번역용 Ollama =="
+if ! command -v brew >/dev/null 2>&1; then
+  mark_fail "Ollama (brew 없음)"
+else
+  if command -v ollama >/dev/null 2>&1 || brew install ollama; then
+    mark_ok "Ollama 설치"
+
+    # pull을 하려면 서버가 떠 있어야 한다. 이미 떠 있으면 그대로 쓴다.
+    started_here=0
+    if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+      echo "Ollama 서버를 띄웁니다."
+      ollama serve >"$TMP/ollama.log" 2>&1 &
+      started_here=1
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+        sleep 1
+      done
+    fi
+
+    # 한국어 번역 품질이 쓸 만한 모델을 순서대로 시도한다.
+    got_model=""
+    for m in exaone3.5:7.8b qwen2.5:7b gemma2:9b; do
+      echo "모델 시도: $m"
+      if ollama pull "$m" 2>&1 | tail -2; then
+        if ollama list 2>/dev/null | grep -q "${m%%:*}"; then
+          got_model="$m"
+          mark_ok "번역 모델 $m"
+          break
+        fi
+      fi
+      echo "  받지 못했습니다. 다음 후보로 넘어갑니다."
+    done
+    [ -n "$got_model" ] || mark_fail "번역 모델 (후보 모두 실패)"
+
+    if [ "$started_here" = "1" ]; then
+      echo "띄워 둔 Ollama 서버를 내립니다."
+      pkill -f "ollama serve" 2>/dev/null || true
+    fi
+  else
+    mark_fail "Ollama 설치"
+  fi
+fi
+
+# ---------------------------------------------------------------
+echo
+echo "=============================================="
+echo " 결과 요약"
+echo "=============================================="
+[ -n "$done_list" ] && printf "%b\n" "$done_list"
+if [ -n "$fail_list" ]; then
+  printf "%b\n" "$fail_list"
+  echo
+  echo "실패한 항목은 위 로그에서 원인을 확인하세요."
+fi
+echo
+echo "받아 둔 실시간 모델 위치: $ROOT/models"
+echo "끝난 시각: $(date '+%Y-%m-%d %H:%M')"

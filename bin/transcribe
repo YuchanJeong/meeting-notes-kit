@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# offline/01-inbox의 녹음 파일을 전사 + 화자분리해서 03-notes에 회의록으로 남긴다.
+#
+#   bin/transcribe                     # inbox에서 아직 처리 안 된 파일 전부
+#   bin/transcribe 주간회의.m4a         # 특정 파일 하나
+#   bin/transcribe 주간회의.m4a --names SPEAKER_00=이우성 SPEAKER_01=김팀장
+set -eo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INBOX="$ROOT/offline/01-inbox"
+TRANS="$ROOT/offline/02-transcripts"
+NOTES="$ROOT/offline/03-notes"
+
+# .env는 기본값일 뿐이다. 명령 앞에 붙여 준 환경변수가 이겨야 한다
+# (set -a 로 그냥 읽으면 .env 쪽이 덮어써 버린다).
+_cli_lang="${WHISPER_LANG:-}"
+_cli_model="${WHISPER_MODEL:-}"
+if [ -f "$ROOT/.env" ]; then
+  set -a; . "$ROOT/.env"; set +a
+fi
+[ -n "$_cli_lang" ]  && WHISPER_LANG="$_cli_lang"
+[ -n "$_cli_model" ] && WHISPER_MODEL="$_cli_model"
+
+# uv tool로 설치하면 ~/.local/bin에 들어가는데 PATH에 없는 경우가 많다
+if [ -d "$HOME/.local/bin" ]; then
+  PATH="$PATH:$HOME/.local/bin"
+fi
+
+MODEL="${WHISPER_MODEL:-large-v3}"
+LANG="${WHISPER_LANG:-ko}"
+
+if ! command -v whisperx >/dev/null 2>&1; then
+  echo "whisperx가 없습니다. 먼저 bin/setup 을 실행해 주세요." >&2
+  exit 1
+fi
+if [ -z "${HF_TOKEN:-}" ]; then
+  echo "HF_TOKEN이 없습니다. .env.example을 .env로 복사한 뒤 토큰을 넣어 주세요." >&2
+  exit 1
+fi
+
+# 첫 인자가 옵션(-로 시작)이 아니면 대상 파일로 본다.
+TARGETS=()
+if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
+  f="$1"; shift
+  [ -f "$f" ] || f="$INBOX/$f"
+  TARGETS+=("$f")
+else
+  while IFS= read -r f; do TARGETS+=("$f"); done < <(
+    find "$INBOX" -type f \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '*.mp4' -o -iname '*.mov' \) | sort
+  )
+fi
+
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  echo "처리할 파일이 없습니다: $INBOX"
+  exit 0
+fi
+
+mkdir -p "$TRANS" "$NOTES"
+
+for audio in "${TARGETS[@]}"; do
+  if [ ! -f "$audio" ]; then
+    echo "건너뜀 (파일 없음): $audio" >&2
+    continue
+  fi
+  base="$(basename "${audio%.*}")"
+  json="$TRANS/$base.json"
+
+  if [ -f "$json" ]; then
+    echo "전사 결과 재사용: $base.json"
+  else
+    echo "전사 시작: $base  (1시간 분량 기준 10~20분 소요)"
+    # whisperx를 그대로 부르면 pyannote 체크포인트에서 죽는다 (bin/whisperx_safe.py 설명 참고).
+    # 같은 환경의 파이썬으로 래퍼를 태워서 부른다.
+    WHISPERX_PY="$(dirname "$(readlink -f "$(command -v whisperx)")")/python"
+    if [ -x "$WHISPERX_PY" ] && [ -f "$ROOT/bin/whisperx_safe.py" ]; then
+      RUN=("$WHISPERX_PY" "$ROOT/bin/whisperx_safe.py")
+    else
+      RUN=(whisperx)
+    fi
+    "${RUN[@]}" "$audio" \
+      --language "$LANG" \
+      --model "$MODEL" \
+      --compute_type int8 \
+      --diarize \
+      --hf_token "$HF_TOKEN" \
+      --output_format json \
+      --output_dir "$TRANS"
+  fi
+
+  python3 "$ROOT/bin/meeting_md.py" "$json" \
+    --title "$base" \
+    --output "$NOTES/$base.md" \
+    "$@"
+done

@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# 스크립트를 고친 뒤 회귀 점검. 실제 녹음과 회의록에는 손대지 않는다.
+#
+# 프로젝트를 임시 폴더로 복사한 다음, 가짜 whisperx와 격리된 HOME으로
+# 전 과정을 돌려 보고 끝나면 임시 폴더를 지운다.
+set -o pipefail
+
+ORIG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SP="$(mktemp -d)"
+trap 'rm -rf "$SP"' EXIT
+
+# 1) 검사용 사본 준비 (녹음 원본과 회의록은 복사하지 않는다)
+ROOT="$SP/proj"
+mkdir -p "$ROOT"/{online/{01-inbox,02-notes},offline/{01-inbox,02-transcripts,03-notes}}
+cp -R "$ORIG/bin" "$ROOT/bin"
+for f in README.md CLAUDE.md .gitignore .env.example; do
+  [ -f "$ORIG/$f" ] && cp "$ORIG/$f" "$ROOT/$f"
+done
+find "$ROOT" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
+touch "$ROOT"/online/01-inbox/.gitkeep "$ROOT"/online/02-notes/.gitkeep \
+      "$ROOT"/offline/01-inbox/.gitkeep "$ROOT"/offline/02-transcripts/.gitkeep \
+      "$ROOT"/offline/03-notes/.gitkeep
+
+# 2) 전사 결과를 흉내 내는 표본
+cat > "$SP/sample.json" <<'JEOF'
+{"segments":[
+{"start":0.0,"end":8.4,"text":" 자, 그럼 릴스 포맷 건부터 볼까요.","speaker":"SPEAKER_00"},
+{"start":8.4,"end":14.2,"text":"지난주에 올린 두 개가 조회수 차이가 꽤 났어요.","speaker":"SPEAKER_00"},
+{"start":14.6,"end":22.1,"text":" 맞아요, 후킹 문구를 3초 안에 넣은 쪽이 확실히 좋았습니다.","speaker":"SPEAKER_01"},
+{"start":22.5,"end":31.0,"text":"","speaker":"SPEAKER_01"},
+{"start":31.2,"end":48.9,"text":" 그럼 다음 주 촬영분부터는 그 포맷으로 통일하죠. 제가 금요일까지 가이드 정리해서 공유할게요.","speaker":"SPEAKER_02"},
+{"start":49.3,"end":63.7,"text":" 좋습니다. 저는 지난 3개월 데이터 뽑아서 같이 붙이겠습니다.","speaker":"SPEAKER_00"}
+]}
+JEOF
+
+# 3) 모델을 내려받지 않고 인자만 확인하기 위한 가짜 whisperx
+mkdir -p "$SP/fakebin"
+cat > "$SP/fakebin/whisperx" <<FEOF
+#!/usr/bin/env bash
+echo "[가짜 whisperx] 받은 인자: \$*"
+out=""; audio="\$1"
+while [ \$# -gt 0 ]; do [ "\$1" = "--output_dir" ] && out="\$2"; shift; done
+cp "$SP/sample.json" "\$out/\$(basename "\${audio%.*}").json"
+FEOF
+chmod +x "$SP/fakebin/whisperx"
+
+cd "$ROOT" || exit 1
+pass=0; fail=0
+ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
+no()  { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
+chk() { if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (기대=$3, 실제=$2)"; fi; }
+has() { if printf '%s' "$2" | grep -q -- "$3"; then ok "$1"; else no "$1 — '$3' 없음"; fi; }
+not() { if printf '%s' "$2" | grep -q -- "$3"; then no "$1 — '$3' 가 나옴"; else ok "$1"; fi; }
+
+echo "[1] 문법 검사"
+for f in bin/meeting bin/setup bin/transcribe bin/import-iphone bin/selftest bin/prefetch bin/live; do
+  bash -n "$f" 2>/dev/null && ok "bash -n $f" || no "bash -n $f"
+done
+for f in bin/meeting_md.py bin/set-token bin/whisperx_safe.py; do
+  python3 -m py_compile "$f" 2>/dev/null && ok "py_compile $(basename "$f")" || no "py_compile $(basename "$f")"
+done
+# translate 는 uv 헤더가 붙어 있어 구문만 따로 본다
+python3 -c "import ast,sys; ast.parse(open('bin/translate').read())" 2>/dev/null \
+  && ok "구문 검사 translate" || no "구문 검사 translate"
+rm -rf bin/__pycache__
+
+echo "[2] 구조와 실행 권한"
+for d in bin online/01-inbox online/02-notes offline/01-inbox offline/02-transcripts offline/03-notes; do
+  [ -d "$d" ] && ok "디렉터리 $d" || no "디렉터리 $d"
+done
+for f in bin/meeting bin/setup bin/transcribe bin/import-iphone bin/meeting_md.py bin/selftest bin/prefetch bin/live bin/translate bin/set-token; do
+  [ -x "$f" ] && ok "실행 권한 $f" || no "실행 권한 $f"
+done
+[ -f .env.example ] && ok ".env.example 존재" || no ".env.example 존재"
+drop_import=$(grep '^DROP=' bin/import-iphone | sed 's|.*CloudDocs/||; s|"$||')
+drop_setup=$(grep '^DROP=' bin/setup | sed 's|.*CloudDocs/||; s|"$||')
+chk "iCloud 폴더 이름이 두 스크립트에서 일치" "$drop_import" "$drop_setup"
+grep -q "iCloud Drive/$drop_import" README.md \
+  && ok "iCloud 폴더 이름이 README와 일치" \
+  || no "iCloud 폴더 이름이 README와 어긋남 (스크립트=$drop_import)"
+
+echo "[3] 문서와 실제 구조 일치"
+for p in bin/setup bin/import-iphone bin/transcribe bin/meeting_md.py bin/selftest bin/prefetch online/01-inbox online/02-notes offline/01-inbox offline/02-transcripts offline/03-notes; do
+  grep -q "$p" README.md && ok "README에 $p 언급" || no "README에 $p 누락"
+done
+
+echo "[4] meeting_md.py 변환 규칙"
+out=$(bin/meeting_md.py "$SP/sample.json" -o "$SP/o1.md" --title T 2>&1)
+has "빈 세그먼트 제외 (6개 중 4블록)" "$out" "발화 블록 4개"
+has "라벨 목록 출력" "$out" "SPEAKER_00, SPEAKER_01, SPEAKER_02"
+body=$(cat "$SP/o1.md")
+has "연속 발화 병합" "$body" "볼까요. 지난주에"
+has "매핑 없으면 라벨 그대로" "$body" "### SPEAKER_00"
+out=$(bin/meeting_md.py "$SP/sample.json" -o "$SP/o2.md" --names SPEAKER_00=이우성 SPEAKER_01=김팀장 2>&1)
+body=$(cat "$SP/o2.md")
+has "이름 치환" "$body" "### 이우성"
+has "일부만 치환해도 나머지 유지" "$body" "### SPEAKER_02"
+has "타임스탬프 mm:ss" "$body" '`00:31`'
+out=$(bin/meeting_md.py "$SP/sample.json" -o "$SP/깊은/경로/o3.md" 2>&1)
+[ -f "$SP/깊은/경로/o3.md" ] && ok "없는 상위 폴더 자동 생성" || no "없는 상위 폴더 자동 생성"
+
+echo "[5] meeting_md.py 예외 처리"
+bin/meeting_md.py "$SP/none.json" >/dev/null 2>&1; chk "없는 파일이면 비정상 종료" "$?" "1"
+echo '{"segments":[]}' > "$SP/empty.json"
+out=$(bin/meeting_md.py "$SP/empty.json" 2>&1); chk "빈 segments면 비정상 종료" "$?" "1"
+has "빈 segments 안내 문구" "$out" "세그먼트가 비어"
+echo '[{"start":0,"end":3,"text":"리스트 형태","speaker":"A"}]' > "$SP/list.json"
+out=$(bin/meeting_md.py "$SP/list.json" -o "$SP/o4.md" 2>&1)
+has "최상위가 리스트인 JSON도 처리" "$out" "발화 블록 1개"
+echo '{"segments":[{"start":0,"end":3,"text":"화자 없음"}]}' > "$SP/nospk.json"
+out=$(bin/meeting_md.py "$SP/nospk.json" -o "$SP/o5.md" 2>&1)
+has "speaker 키가 없으면 UNKNOWN" "$out" "UNKNOWN"
+
+echo "[6] transcribe 분기"
+out=$(HF_TOKEN= PATH="$SP/fakebin:$PATH" bin/transcribe 2>&1); chk "토큰 없으면 종료" "$?" "1"
+has "토큰 안내 문구" "$out" "HF_TOKEN이 없습니다"
+mkdir -p "$SP/nohome"
+out=$(HOME="$SP/nohome" HF_TOKEN=hf_x PATH="/usr/bin:/bin" bin/transcribe 2>&1); chk "whisperx 없으면 종료" "$?" "1"
+has "설치 안내 문구" "$out" "bin/setup"
+# uv tool은 ~/.local/bin에 설치하는데 PATH에 없는 것이 기본값이라 스크립트가 직접 찾아야 한다
+mkdir -p "$SP/uvhome/.local/bin"
+cp "$SP/fakebin/whisperx" "$SP/uvhome/.local/bin/whisperx"
+out=$(HOME="$SP/uvhome" HF_TOKEN=hf_x PATH="/usr/bin:/bin" bin/transcribe 2>&1)
+has "PATH에 없어도 ~/.local/bin의 whisperx를 찾음" "$out" "처리할 파일이 없습니다"
+# PATH에 있는 것이 ~/.local/bin보다 우선해야 한다.
+# 순서가 뒤집히면 이 점검이 진짜 whisperx를 불러 모델을 내려받기 시작한다.
+printf '#!/bin/sh\necho LOCALBIN_WON\n' > "$SP/uvhome/.local/bin/whisperx"
+chmod +x "$SP/uvhome/.local/bin/whisperx"
+touch offline/01-inbox/prio.m4a
+out=$(HOME="$SP/uvhome" HF_TOKEN=hf_x PATH="$SP/fakebin:/usr/bin:/bin" bin/transcribe 2>&1)
+not "PATH의 whisperx가 ~/.local/bin보다 우선" "$out" "LOCALBIN_WON"
+rm -f offline/01-inbox/prio.m4a offline/02-transcripts/prio.json offline/03-notes/prio.md
+out=$(HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe 2>&1); chk "빈 inbox는 정상 종료" "$?" "0"
+has "빈 inbox 안내" "$out" "처리할 파일이 없습니다"
+
+echo "[7] transcribe 실제 흐름"
+touch offline/01-inbox/weekly.m4a offline/01-inbox/"기획 미팅.m4a"
+out=$(HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe 2>&1)
+[ -f offline/02-transcripts/weekly.json ] && ok "JSON 생성" || no "JSON 생성"
+[ -f offline/03-notes/weekly.md ] && ok "회의록 생성" || no "회의록 생성"
+[ -f offline/03-notes/"기획 미팅.md" ] && ok "공백 있는 파일명 처리" || no "공백 있는 파일명 처리"
+has "언어 인자 ko 전달" "$out" "--language ko"
+has "화자분리 인자 전달" "$out" "--diarize"
+out=$(HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe weekly.m4a --names SPEAKER_00=이우성 2>&1)
+has "두 번째 실행은 전사 재사용" "$out" "전사 결과 재사용"
+not "재사용 시 whisperx 미호출" "$out" "가짜 whisperx"
+has "이름이 회의록에 반영" "$(cat offline/03-notes/weekly.md)" "### 이우성"
+out=$(HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe 없는파일.m4a 2>&1)
+has "없는 파일은 건너뛰고 안내" "$out" "건너뜀"
+WHISPER_LANG=en WHISPER_MODEL=medium HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe > "$SP/envtest.log" 2>&1
+rm -f offline/02-transcripts/*.json offline/03-notes/*.md
+touch offline/01-inbox/envcheck.m4a
+out=$(WHISPER_LANG=en WHISPER_MODEL=medium HF_TOKEN=hf_x PATH="$SP/fakebin:$PATH" bin/transcribe 2>&1)
+has "환경변수로 언어 변경" "$out" "--language en"
+has "환경변수로 모델 변경" "$out" "--model medium"
+rm -f offline/01-inbox/* offline/02-transcripts/*.json offline/03-notes/*.md
+touch offline/01-inbox/.gitkeep offline/02-transcripts/.gitkeep offline/03-notes/.gitkeep
+
+echo "[8] import-iphone 분기"
+FAKE="$SP/fh"; rm -rf "$FAKE"
+D="$FAKE/Library/Mobile Documents/com~apple~CloudDocs/meeting-notes"
+mkdir -p "$D" "$FAKE/Downloads"
+out=$(HOME="$FAKE" bin/import-iphone 2>&1)
+has "가져올 게 없을 때 안내" "$out" "후보 0개 중 0개"
+has "iCloud 경로 안내" "$out" "파일에 저장"
+printf x > "$D/새로운 녹음 3.m4a"; printf x > "$FAKE/Downloads/airdrop.m4a"
+out=$(HOME="$FAKE" bin/import-iphone 2>&1)
+has "iCloud 폴더에서 가져옴" "$out" "새로운 녹음 3.m4a"
+has "다운로드 폴더에서도 가져옴" "$out" "airdrop.m4a"
+has "집계 정확" "$out" "후보 2개 중 2개"
+has "다음 단계 안내" "$out" "bin/transcribe"
+out=$(HOME="$FAKE" bin/import-iphone 2>&1)
+has "중복은 건너뜀" "$out" "이미 있음"
+has "새 파일 없을 때 별도 안내" "$out" "새로 가져올 파일은 없습니다"
+touch -t 202001010000 "$D/오래된녹음.m4a"
+out=$(HOME="$FAKE" bin/import-iphone 2>&1)
+not "기간 밖 파일 제외" "$out" "오래된녹음"
+out=$(HOME="$FAKE" bin/import-iphone 9999 2>&1)
+has "일수 인자로 기간 확장" "$out" "오래된녹음.m4a"
+rm -f offline/01-inbox/*.m4a
+
+echo "[10] translate — 겹치는 전사 다루기"
+# whisper 는 같은 구간을 거듭 받아 적는다. 겹침을 못 걷으면 같은 말이 거듭 번역된다.
+out=$(printf 'Actually, I think--\nActually, I think you are quite\nActually, I think you are quite good.\n' \
+      | timeout 60 bin/translate --no-translate --plain --no-save 2>/dev/null)
+chk "자라는 조각은 하나로 합쳐진다" "$out" "Actually, I think you are quite good."
+out2=$(printf 'Hello there.\nSomething else entirely.\n' \
+      | timeout 60 bin/translate --no-translate --plain --no-save 2>/dev/null)
+has "이어지지 않는 발화는 따로 나온다" "$out2" "Hello there."
+has "두 번째 발화도 살아 있다" "$out2" "Something else entirely."
+
+echo "[11] live — 받다 만 모델 거르기"
+# 크기만 보고 통과시키면 반쪽짜리 모델을 읽다 조용히 죽는다 (2026-09-21 실제로 겪음)
+mkdir -p "$ROOT/models"
+printf 'x' > "$ROOT/models/ggml-medium.en.bin"          # 1바이트짜리 가짜
+cp "$SP/fakebin/whisperx" "$SP/fakebin/whisper-stream" 2>/dev/null || true
+out=$(LIVE_MODEL=medium.en PATH="$SP/fakebin:$PATH" timeout 30 bin/live --mic 2>&1 | head -4)
+has "받는 중인 모델을 알아차린다" "$out" "아직 받는 중"
+rm -f "$ROOT/models/ggml-medium.en.bin"
+
+echo "[12] transcribe — 환경변수가 .env 를 이긴다"
+# set -a 로 .env 를 읽으면 .env 가 덮어써 버린다 (실제로 --language 가 무시됐다)
+printf 'HF_TOKEN=x\nWHISPER_LANG=ko\nWHISPER_MODEL=large-v3\n' > "$ROOT/.env"
+touch "$ROOT/offline/01-inbox/envwin.m4a"
+out=$(WHISPER_LANG=en WHISPER_MODEL=base HF_TOKEN=x PATH="$SP/fakebin:$PATH" bin/transcribe 2>&1)
+has "명령에 준 언어가 이긴다" "$out" "--language en"
+has "명령에 준 모델이 이긴다" "$out" "--model base"
+rm -f "$ROOT/offline/01-inbox/envwin.m4a" "$ROOT/offline/02-transcripts/envwin.json" "$ROOT/offline/03-notes/envwin.md"
+
+echo "[13] whisperx 패치 — weights_only 를 덮어쓴다"
+# setdefault 로는 듣지 않는다. lightning 이 True 를 명시적으로 넘기기 때문이다.
+grep -q 'kwargs\["weights_only"\] = False' bin/whisperx_safe.py \
+  && ok "weights_only 를 강제로 끈다" || no "weights_only 를 강제로 끄지 않는다"
+not "setdefault 로 되돌아가지 않았다" "$(cat bin/whisperx_safe.py)" 'setdefault("weights_only"'
+grep -q 'whisperx_safe.py' bin/transcribe \
+  && ok "transcribe 가 패치를 거쳐 부른다" || no "transcribe 가 패치를 거치지 않는다"
+
+echo "[14] 사용성 — 받는 중 파일과 소리 되돌리기"
+# 받다 만 모델을 제자리에 두면 bin/live 가 그것을 읽다 죽는다 (2026-09-21)
+grep -q '\.part' bin/prefetch \
+  && ok "prefetch 는 임시 이름으로 받는다" || no "prefetch 가 제자리에 바로 받는다"
+grep -q 'mv "$MODEL_DIR/$m.part"' bin/prefetch \
+  && ok "다 받은 뒤에 옮긴다" || no "다 받은 뒤 옮기지 않는다"
+# 자막을 켜느라 바꾼 소리 출력은 끝날 때 돌려놔야 한다
+grep -q 'restore_audio' bin/live \
+  && ok "live 가 소리 출력을 되돌린다" || no "live 가 소리 출력을 되돌리지 않는다"
+grep -q 'trap cleanup EXIT' bin/live \
+  && ok "끝날 때 반드시 정리한다" || no "정리 훅이 걸려 있지 않다"
+grep -q '\-\-keep-audio' bin/live \
+  && ok "소리를 건드리지 않는 선택지가 있다" || no "--keep-audio 가 없다"
+# 번역 없이 전사만 쓰는 길 (한국어 회의)
+out=$(printf 'Hello there.\n' | timeout 60 bin/translate --no-translate --plain --no-save 2>&1)
+has "번역 없이도 전사가 나온다" "$out" "Hello there."
+grep -q 'no-translate' bin/live \
+  && ok "한국어 모드가 같은 정리 과정을 거친다" || no "한국어 모드가 정리를 건너뛴다"
+
+echo "[15] 스크립트끼리 주고받는 인자와 문서"
+# live 가 넘기는 옵션을 translate 가 모르면 파이프 끝에서 죽는다 (--show-source 가 그랬다)
+tr_help=$(timeout 120 bin/translate --help 2>&1)
+# 옵션이 두 갈래로 넘어간다. 곧바로 적는 것과, 변수에 담아 두었다가 넘기는 것.
+# 변수 쪽을 빠뜨리면 --show-source 같은 어긋남을 그대로 놓친다.
+live_vars=$(grep -oE 'TRANSLATE_ARGS\+?=\("\$[A-Z_]+"\)' bin/live | sed -E 's/.*\$([A-Z_]+).*/\1/')
+live_passes=$( { grep -oE 'TRANSLATE_ARGS\+?=\([^)]*' bin/live
+                 for v in $live_vars; do grep -oE "$v=\"--[a-z-]+\"" bin/live; done
+               } | grep -oE '\-\-[a-z][a-z-]*' | sort -u )
+[ -n "$live_passes" ] && ok "live 가 넘기는 옵션을 찾았다" || no "live 에서 넘기는 옵션을 못 찾았다"
+for o in $live_passes; do
+  has "translate 가 $o 를 받는다" "$tr_help" "$o"
+done
+
+# README 대로 따라 했는데 live 가 모르는 옵션이면 그 자리에서 막힌다 (--no-save 가 그랬다)
+doc_opts=$(awk '/^## 실시간 자막/,/^## online/' README.md | grep -v 'setup-audio' \
+           | grep -oE '\-\-[a-z][a-z-]*' | sort -u)
+[ -n "$doc_opts" ] && ok "README 에서 live 옵션을 찾았다" || no "README 에서 live 옵션을 못 찾았다"
+for o in $doc_opts; do
+  if grep -qE "(^[[:space:]]*|\|)$o(\)|\|)" bin/live; then
+    ok "live 가 $o 를 받는다"
+  else
+    no "README 에 있는 $o 를 live 가 모른다"
+  fi
+done
+
+# 도움말은 주석을 줄 번호로 잘라 쓴다. 옵션을 늘리고 범위를 안 고치면 통째로 안 보인다.
+live_help=$(bin/live --help 2>&1)
+for o in $doc_opts; do
+  has "도움말에 $o 가 보인다" "$live_help" "$o"
+done
+
+# 명령 목록에 설명이 없으면 무엇부터 해야 할지 알 수 없다
+menu=$(bin/meeting 2>&1)
+for f in bin/*; do
+  [ -d "$f" ] && continue
+  base="$(basename "$f")"; base="${base%.py}"; base="${base%.swift}"
+  case "$base" in whisperx_safe|meeting) continue ;; esac
+  # 이름 뒤에 공백을 두고 설명이 이어지는지 본다 (setup 과 setup-audio 를 섞지 않는다)
+  if printf '%s' "$menu" | grep -qE "meeting $base +[^ ]"; then
+    ok "목록에 $base 설명이 있다"
+  else
+    no "목록에 $base 설명이 없다"
+  fi
+done
+
+# 없는 스크립트를 안내하면 그대로 막다른 길이 된다 (실제로 그런 안내가 남아 있었다)
+# 앞에 /가 붙은 것은 /usr/bin/env 같은 시스템 경로이므로 세지 않는다
+for ref in $(grep -ohE '(^|\$ROOT/|[^/a-zA-Z0-9_.])bin/[a-z_][a-z0-9_-]*(\.py|\.swift)?' bin/* \
+             | sed -E 's|^.*bin/|bin/|' | grep -v '__pycache__' | sort -u); do
+  [ -e "$ref" ] && ok "안내 경로 $ref 가 있다" || no "안내 경로 $ref 가 없다"
+done
+
+echo "[9] .gitignore"
+T="$SP/gitchk"; rm -rf "$T"; mkdir -p "$T"
+cp -R bin online offline .gitignore .env.example CLAUDE.md README.md "$T"/
+cd "$T" || exit 1
+printf 'HF_TOKEN=secret\n' > .env
+printf x > offline/01-inbox/비밀녹음.m4a
+printf '{}' > offline/02-transcripts/비밀전사.json
+printf '# note\n' > offline/03-notes/회의록.md
+printf '# 자막\n' > online/02-notes/2026-01-01-0000-실시간자막.md
+printf '# 템플릿\n' > online/02-notes/_template.md
+git init -q . && git add -A 2>/dev/null
+staged=$(git -c core.quotePath=false diff --cached --name-only)
+not ".env 제외" "$staged" "^.env$"
+not "녹음 원본 제외" "$staged" "01-inbox/비밀녹음"
+not "전사 JSON 제외" "$staged" "02-transcripts/비밀전사"
+# 회의록에는 실명과 내부 내용이 담긴다. 공개 저장소이므로 올라가면 안 된다.
+not "현장 회의록 제외" "$staged" "03-notes/회의록.md"
+not "온라인 자막 제외" "$staged" "02-notes/2026-01-01"
+has "작성용 템플릿은 추적" "$staged" "02-notes/_template.md"
+has "스크립트는 추적" "$staged" "bin/transcribe"
+has ".gitkeep은 추적" "$staged" "01-inbox/.gitkeep"
+cd "$ROOT" || exit 1
+
+echo
+echo "===== 통과 $pass / 실패 $fail ====="
+[ "$fail" -eq 0 ]

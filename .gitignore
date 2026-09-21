@@ -1,0 +1,16 @@
+.env
+models/
+.DS_Store
+__pycache__/
+
+# 녹음 원본, 전사 JSON, 회의록은 저장소에 올리지 않는다.
+# 회의록에는 실명과 내부 내용이 담기므로 공개 저장소에 두지 않는다.
+offline/01-inbox/*
+offline/02-transcripts/*
+offline/03-notes/*
+online/01-inbox/*
+online/02-notes/*
+
+# 폴더 구조와 작성용 템플릿은 남긴다
+!**/.gitkeep
+!online/02-notes/_template.md

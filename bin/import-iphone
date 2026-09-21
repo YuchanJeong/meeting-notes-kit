@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# 아이폰으로 녹음한 파일을 offline/01-inbox로 모아 온다.
+#
+#   bin/import-iphone        # 최근 2일 내 파일
+#   bin/import-iphone 7      # 최근 7일 내 파일
+set -eo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INBOX="$ROOT/offline/01-inbox"
+DAYS="${1:-2}"
+DROP="$HOME/Library/Mobile Documents/com~apple~CloudDocs/meeting-notes"
+
+mkdir -p "$INBOX"
+
+# 찾아볼 위치: iCloud Drive 전용 폴더, 음성 메모 저장소, 에어드롭 수신함
+SOURCES=(
+  "$DROP"
+  "$HOME/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+  "$HOME/Downloads"
+)
+
+found=0
+copied=0
+
+for src in "${SOURCES[@]}"; do
+  [ -d "$src" ] || continue
+  if ! ls "$src" >/dev/null 2>&1; then
+    echo "권한 없어 건너뜀: $src"
+    echo "  (음성 메모 저장소를 직접 읽으려면 시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근 권한에 터미널을 추가해야 합니다)"
+    continue
+  fi
+
+  while IFS= read -r f; do
+    found=$((found + 1))
+    name="$(basename "$f")"
+
+    # iCloud에서 아직 내려받지 않은 플레이스홀더면 먼저 내려받는다
+    case "$name" in
+      .*.icloud)
+        real="${name#.}"; real="${real%.icloud}"
+        echo "iCloud에서 내려받는 중: $real"
+        brctl download "$f" 2>/dev/null || true
+        f="$(dirname "$f")/$real"
+        name="$real"
+        # 내려받기는 비동기라 최대 10초까지 기다려 본다
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          [ -f "$f" ] && break
+          sleep 1
+        done
+        if [ ! -f "$f" ]; then
+          echo "  아직 내려받지 못했습니다. Finder에서 '$real'을 한 번 열어 둔 뒤 다시 실행해 주세요."
+          continue
+        fi
+        ;;
+    esac
+
+    if [ -f "$INBOX/$name" ]; then
+      echo "이미 있음: $name"
+      continue
+    fi
+    cp -p "$f" "$INBOX/$name"
+    copied=$((copied + 1))
+    echo "가져옴: $name  <-  ${src/#$HOME/~}"
+  done < <(find "$src" -maxdepth 2 -type f \
+             \( -iname '*.m4a' -o -iname '*.mp3' -o -iname '*.wav' -o -iname '.*.m4a.icloud' \) \
+             -mtime -"$DAYS" 2>/dev/null | sort)
+done
+
+echo
+echo "최근 ${DAYS}일 기준: 후보 ${found}개 중 ${copied}개를 가져왔습니다."
+if [ "$copied" -gt 0 ]; then
+  echo "다음 단계: bin/transcribe"
+elif [ "$found" -gt 0 ]; then
+  echo "새로 가져올 파일은 없습니다. 이미 받아 둔 녹음을 처리하려면 bin/transcribe 를 실행하세요."
+else
+  echo "아이폰 음성 메모 앱에서 [공유] > [파일에 저장] > iCloud Drive/meeting-notes 로 보낸 뒤 다시 실행하세요."
+fi

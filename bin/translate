@@ -1,0 +1,596 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["anthropic"]
+# ///
+"""
+영어를 한국어로 옮긴다. 표준입력을 줄 단위로 받아 번역해서 내보낸다.
+
+실시간 자막 파이프라인의 번역 단계이며, 백엔드를 골라 쓸 수 있다.
+
+    ollama      로컬에서 돌고 비용이 들지 않는다. 모델이 올라오면 1초 안쪽이라 실시간에 맞다. 기본값.
+    claude-cli  claude 명령을 부른다. API 키가 필요 없고 구독 한도를 쓴다. 다만 한 번에 5초쯤 걸린다.
+    claude      Claude API를 직접 부른다. 가장 빠르고 품질도 좋지만 API 키와 토큰 비용이 필요하다.
+
+사용법:
+    echo "Let's start with the reels format." | bin/translate
+    bin/translate --backend claude --context "마케팅 팀 주간 회의, 릴스와 후킹 문구 이야기"
+    whisper-cli --stream ... | bin/translate --backend claude
+"""
+
+import argparse
+import datetime
+import json
+import os
+import queue
+import re
+import select
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+OLLAMA_URL = "http://127.0.0.1:11434"
+
+SYSTEM = """당신은 회의 통역사입니다. 영어 발화를 한국어로 옮깁니다.
+
+규칙:
+- 번역문만 출력합니다. 설명, 따옴표, 원문 병기를 넣지 않습니다.
+- 회의에서 말하듯 자연스러운 구어체로 옮깁니다.
+- 고유명사, 제품명, 기술 용어는 통용되는 번역어가 없으면 원어를 그대로 둡니다.
+- 문장이 중간에 끊겨 있으면 끊긴 그대로 옮깁니다. 내용을 추측해 채우지 않습니다."""
+
+
+def load_env():
+    # .env의 값을 환경변수로 올린다. 이미 설정된 환경변수가 우선한다.
+    env = ROOT / ".env"
+    if not env.exists():
+        return
+    for line in env.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip())
+
+
+def build_prompt(text, context):
+    if context:
+        return f"회의 맥락: {context}\n\n다음 영어 발화를 한국어로 옮기세요.\n\n{text}"
+    return f"다음 영어 발화를 한국어로 옮기세요.\n\n{text}"
+
+
+class OllamaBackend:
+    """로컬 Ollama 서버에 붙는다. 의존성 없이 HTTP로 직접 부른다."""
+
+    def __init__(self, model, context):
+        self.model = model or os.environ.get("OLLAMA_MODEL", "exaone3.5:7.8b")
+        self.context = context
+        self.check()
+
+    def _tags(self, timeout=3):
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    def check(self):
+        try:
+            tags = self._tags()
+        except Exception:
+            tags = self._start_server()
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        if not any(n.startswith(self.model.split(":")[0]) for n in names):
+            sys.exit(
+                f"모델을 찾지 못했습니다: {self.model}\n"
+                f"  설치된 모델: {', '.join(names) or '없음'}\n"
+                f"  'ollama pull {self.model}' 로 받을 수 있습니다."
+            )
+
+    def _start_server(self):
+        """서버가 꺼져 있으면 직접 띄운다. 사람에게 다른 터미널을 열게 하지 않는다."""
+        import shutil
+        import subprocess
+
+        if not shutil.which("ollama"):
+            sys.exit(
+                "Ollama 가 깔려 있지 않습니다.\n"
+                "  'brew install ollama' 로 설치하거나, --backend claude-cli 를 쓰세요."
+            )
+
+        print("Ollama 서버를 띄우는 중…", file=sys.stderr, flush=True)
+        try:
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            sys.exit(f"Ollama 서버를 띄우지 못했습니다: {e}")
+
+        for _ in range(20):
+            time.sleep(1)
+            try:
+                return self._tags()
+            except Exception:
+                continue
+        sys.exit("Ollama 서버가 응답하지 않습니다. 'ollama serve' 를 직접 띄워 확인해 주세요.")
+
+    def warmup(self):
+        # 모델을 메모리에 올려 둔다. 이걸 안 하면 첫 자막이 20초 넘게 늦는다.
+        try:
+            payload = json.dumps(
+                {"model": self.model, "prompt": "hi", "stream": False,
+                 "keep_alive": "30m", "options": {"num_predict": 1}}
+            ).encode()
+            req = urllib.request.Request(
+                f"{OLLAMA_URL}/api/generate", data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=180).read()
+        except Exception:
+            pass   # 워밍업 실패는 치명적이지 않다. 첫 번역이 느려질 뿐이다.
+
+    def _request(self, text, stream):
+        payload = json.dumps(
+            {
+                "model": self.model,
+                "keep_alive": "30m",
+                "system": SYSTEM,
+                "prompt": build_prompt(text, self.context),
+                "stream": stream,
+                "options": {"temperature": 0.2, "num_predict": 200},
+            }
+        ).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(req, timeout=120)
+
+    def translate(self, text):
+        with self._request(text, stream=False) as r:
+            return json.loads(r.read().decode()).get("response", "").strip()
+
+    def stream_translate(self, text):
+        # 응답이 JSON 한 줄씩 온다. 오는 대로 내보낸다.
+        with self._request(text, stream=True) as r:
+            for raw in r:
+                if not raw.strip():
+                    continue
+                try:
+                    piece = json.loads(raw.decode()).get("response", "")
+                except ValueError:
+                    continue
+                if piece:
+                    yield piece
+
+
+class ClaudeBackend:
+    """Claude API에 붙는다. 실시간이라 effort를 낮춰 지연을 줄인다."""
+
+    def __init__(self, model, context):
+        try:
+            import anthropic
+        except ImportError:
+            sys.exit("anthropic SDK를 불러오지 못했습니다. 'uv run bin/translate' 형태로 실행해 주세요.")
+
+        self.model = model or os.environ.get("CLAUDE_MODEL", "claude-opus-5")
+        self.context = context
+        try:
+            self.client = anthropic.Anthropic()
+        except Exception as e:
+            sys.exit(f"Claude 클라이언트를 만들지 못했습니다: {e}")
+
+        if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+            sys.exit(
+                "Claude API 인증 정보가 없습니다.\n"
+                "  .env 에 ANTHROPIC_API_KEY=... 한 줄을 넣어 주세요.\n"
+                "  키 없이 쓰려면 --backend claude-cli 로 구독 계정을 쓸 수 있습니다."
+            )
+
+    def warmup(self):
+        pass   # API는 미리 데울 것이 없다
+
+    def stream_translate(self, text):
+        yield self.translate(text)
+
+    def translate(self, text):
+        import anthropic
+
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=2048,
+                system=SYSTEM,
+                output_config={"effort": "low"},
+                messages=[{"role": "user", "content": build_prompt(text, self.context)}],
+            )
+        except anthropic.APIStatusError as e:
+            return f"[번역 실패 HTTP {e.status_code}] {text}"
+        except anthropic.APIConnectionError:
+            return f"[연결 실패] {text}"
+
+        if resp.stop_reason == "refusal":
+            return f"[번역 거부됨] {text}"
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+class ClaudeCliBackend:
+    """claude 명령을 부른다. API 키 없이 구독 계정으로 동작한다."""
+
+    def __init__(self, model, context):
+        import shutil
+
+        if not shutil.which("claude"):
+            sys.exit(
+                "claude 명령을 찾지 못했습니다.\n"
+                "  'brew install claude' 로 설치하거나 --backend ollama 를 쓰세요."
+            )
+        self.model = model or "구독 기본 모델"
+        self.context = context
+        self.cli_model = model
+
+    def warmup(self):
+        pass   # CLI는 매번 새로 뜨므로 미리 데울 것이 없다
+
+    def stream_translate(self, text):
+        yield self.translate(text)
+
+    def translate(self, text):
+        import subprocess
+
+        cmd = ["claude", "-p", SYSTEM]
+        if self.cli_model:
+            cmd += ["--model", self.cli_model]
+        try:
+            r = subprocess.run(
+                cmd, input=build_prompt(text, self.context),
+                capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return f"[시간 초과] {text}"
+        if r.returncode != 0:
+            return f"[번역 실패] {text}"
+        return r.stdout.strip()
+
+
+def normalize(text):
+    return "".join(ch.lower() for ch in text if ch.isalnum())
+
+
+_PUNCT = re.compile(r"[^0-9a-z가-힣]+")
+
+
+def words_of(text):
+    out = []
+    for raw in text.lower().split():
+        w = _PUNCT.sub("", raw)
+        if w:
+            out.append(w)
+    return out
+
+
+def extends(new_text, old_text):
+    """새 조각이 이전 조각을 앞에 그대로 품고 있으면, 같은 발화가 자란 것이다."""
+    if not old_text:
+        return False
+    o, n = words_of(old_text), words_of(new_text)
+    return len(n) >= len(o) and n[: len(o)] == o
+
+
+def strip_overlap(text, recent_raw):
+    """
+    앞서 내보낸 말이 새 조각의 앞부분에 다시 들어 있으면 그만큼 잘라낸다.
+
+    whisper는 침묵이 잡힐 때마다 최근 몇 초를 통째로 다시 받아 적는다.
+    그대로 두면 같은 문장이 자막에 거듭 뜨고, 번역도 그만큼 헛돈다.
+    """
+    # 겹침이 여러 겹으로 쌓이므로 더 잘리지 않을 때까지 되풀이한다
+    for _ in range(6):
+        w = words_of(text)
+        if not w:
+            return text
+        for prev in recent_raw:
+            pw = words_of(prev)
+            if pw and len(pw) < len(w) and w[: len(pw)] == pw:
+                text = " ".join(text.split()[len(pw):]).strip()
+                break
+        else:
+            break
+    return text
+
+
+def is_repeat(text, recent):
+    """직전에 내보낸 것과 같거나, 그 안에 통째로 들어가면 중복으로 본다."""
+    key = normalize(text)
+    if not key:
+        return True
+    for prev in recent:
+        if key == prev:
+            return True
+        # 짧은 조각이 직전 문장의 일부이면 이미 내보낸 내용이다
+        if len(key) < len(prev) and key in prev:
+            return True
+    return False
+
+
+def utterances(stream, idle_timeout, on_partial):
+    """
+    전사 조각을 받아 '다 자란 발화'만 내보낸다.
+
+    whisper는 같은 구간을 거듭 받아 적으며 조금씩 길어진 결과를 준다.
+    그때마다 번역하면 같은 말을 서너 번 옮기느라 자막이 밀린다.
+    자라는 동안은 화면만 고쳐 쓰고, 멈추면 그때 한 번 내보낸다.
+    """
+    buf = ""
+    while True:
+        ready, _, _ = select.select([stream], [], [], idle_timeout)
+        if not ready:
+            if buf:
+                yield buf
+                buf = ""
+            continue
+
+        line = stream.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+
+        if extends(line, buf):
+            buf = line
+            on_partial(buf)          # 같은 발화가 자랐다 - 줄만 고쳐 쓴다
+        else:
+            if buf:
+                yield buf            # 앞 발화는 다 자랐다
+            buf = line
+            on_partial(buf)
+
+    if buf:
+        yield buf
+
+
+def sentences(stream, flush_after):
+    """
+    전사기가 뱉는 조각을 문장 단위로 모아서 내보낸다.
+
+    조각마다 번역하면 문맥이 끊겨 품질이 무너지고, 무한정 모으면 자막이 늦는다.
+    문장 부호가 나오거나 일정 시간 새 입력이 없으면 내보낸다.
+    """
+    buf = ""
+    last = time.monotonic()
+    recent = []          # 최근에 내보낸 것들 (중복 판정용)
+    recent_raw = []      # 겹침을 잘라내려면 원문 그대로도 필요하다
+
+    def emit(text):
+        text = strip_overlap(text, recent_raw)
+        if not text or is_repeat(text, recent):
+            return None
+        recent.append(normalize(text))
+        recent_raw.append(text)
+        del recent[:-6]
+        del recent_raw[:-6]
+        return text
+
+    for line in stream:
+        line = line.strip()
+        now = time.monotonic()
+
+        # 조용한 시간이 길었으면 들고 있던 것을 먼저 흘려보낸다
+        if buf and now - last > flush_after:
+            if (out := emit(buf)) is not None:
+                yield out
+            buf = ""
+
+        last = now
+        if not line:
+            continue
+
+        buf = f"{buf} {line}".strip()
+        if buf.endswith((".", "!", "?", "…")) or len(buf) > 400:
+            if (out := emit(buf)) is not None:
+                yield out
+            buf = ""
+
+    if buf and (out := emit(buf)) is not None:
+        yield out
+
+
+class Controls:
+    """스페이스로 멈추고 이어 가고, q로 끝낸다."""
+
+    def __init__(self):
+        self.paused = False
+        self.quit = False
+        self._tty = None
+        self._saved = None
+
+    def start(self):
+        try:
+            self._tty = open("/dev/tty")
+        except OSError:
+            return False   # 터미널이 없으면 키 조작 없이 그냥 흘린다
+        threading.Thread(target=self._watch, daemon=True).start()
+        return True
+
+    def _watch(self):
+        fd = self._tty.fileno()
+        try:
+            self._saved = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except termios.error:
+            return
+        try:
+            while not self.quit:
+                ch = self._tty.read(1)
+                if ch == " ":
+                    self.paused = not self.paused
+                    state = "멈춤 — 스페이스로 다시 시작" if self.paused else "다시 받는 중"
+                    print(f"\n  [{state}]\n", file=sys.stderr, flush=True)
+                elif ch in ("q", "Q"):
+                    self.quit = True
+                    print("\n  [끝냅니다]", file=sys.stderr, flush=True)
+                    os.kill(os.getpid(), signal.SIGINT)
+        finally:
+            self.restore()
+
+    def restore(self):
+        if self._tty and self._saved:
+            try:
+                termios.tcsetattr(self._tty.fileno(), termios.TCSADRAIN, self._saved)
+            except Exception:
+                pass
+
+
+def save_log(lines, root):
+    if not lines:
+        return None
+    out = root / "online" / "02-notes"
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
+    path = out / f"{stamp}-실시간자막.md"
+    body = [f"# 실시간 자막 {stamp}", ""]
+    for en, ko in lines:
+        body.append(f"{en}")
+        body.append(f"→ {ko}")
+        body.append("")
+    path.write_text("\n".join(body), encoding="utf-8")
+    return path
+
+
+def main():
+    load_env()
+
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--backend",
+        choices=["ollama", "claude-cli", "claude"],
+        default=os.environ.get("TRANSLATE_BACKEND", "ollama"),
+        help="번역에 쓸 백엔드 (기본값: ollama)",
+    )
+    p.add_argument("--model", default=None, help="백엔드의 기본 모델 대신 쓸 모델")
+    p.add_argument("--context", default=None, help="회의 주제나 용어를 알려 주면 번역이 정확해집니다")
+    p.add_argument("--flush-after", type=float, default=1.2, help="이 시간(초) 동안 입력이 없으면 번역")
+    p.add_argument("--no-source", action="store_true", help="원문을 감추고 번역만 출력")
+    p.add_argument("--plain", action="store_true", help="색을 쓰지 않음 (파일로 저장할 때)")
+    p.add_argument("--no-save", action="store_true", help="끝낼 때 자막을 파일로 남기지 않음")
+    p.add_argument("--no-translate", action="store_true",
+                   help="번역하지 않고 정리된 전사만 내보냄 (한국어 회의 등)")
+    args = p.parse_args()
+
+    if args.no_translate:
+        backend = None
+    else:
+        backends = {
+            "ollama": OllamaBackend,
+            "claude-cli": ClaudeCliBackend,
+            "claude": ClaudeBackend,
+        }
+        backend = backends[args.backend](args.model, args.context)
+
+    color = not args.plain and sys.stdout.isatty()
+    DIM, RESET, BOLD = ("\033[2m", "\033[0m", "\033[1m") if color else ("", "", "")
+
+    if backend is None:
+        print("전사만 정리해서 내보냅니다 (번역 없음).\n", file=sys.stderr)
+    else:
+        print(f"[{args.backend} / {backend.model}] 준비 중…", file=sys.stderr)
+        backend.warmup()
+        print("번역을 시작합니다.\n", file=sys.stderr)
+
+    # 원문을 먼저 보여 주고 번역은 뒤따라오게 한다.
+    # 한 줄씩 번역을 기다리면 원문까지 함께 늦어져서, 말이 끝난 뒤에야 화면이 움직인다.
+    jobs = queue.Queue()
+    lock = threading.Lock()
+    transcript = []      # 끝낼 때 파일로 남기기 위한 기록
+
+    controls = Controls()
+    if controls.start():
+        print("  스페이스: 멈춤·재개   q: 끝내기\n", file=sys.stderr, flush=True)
+
+    def worker():
+        while True:
+            item = jobs.get()
+            if item is None:
+                break
+            seq, text = item
+            if backend is None:
+                with lock:
+                    print(text, flush=True)
+                transcript.append((text, ""))
+                jobs.task_done()
+                continue
+            collected = []
+            with lock:
+                sys.stdout.write(f"{BOLD}→ ")
+                sys.stdout.flush()
+                for piece in backend.stream_translate(text):
+                    collected.append(piece)
+                    sys.stdout.write(piece)
+                    sys.stdout.flush()
+                sys.stdout.write(f"{RESET}\n\n")
+                sys.stdout.flush()
+            transcript.append((text, "".join(collected).strip()))
+            jobs.task_done()
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+
+    seq = 0
+    live_line = {"open": False}
+
+    def show_partial(text):
+        # 자라는 중인 발화는 한 줄에 겹쳐 쓴다. 터미널이 아니면 굳이 지우지 않는다.
+        if args.no_source or controls.paused:
+            return
+        if backend is None and not color:
+            return   # 번역이 없고 색도 못 쓰면, 확정된 줄만 내보내면 된다
+        with lock:
+            if color:
+                sys.stdout.write("\r\033[2K")
+            elif live_line["open"]:
+                sys.stdout.write("\n")
+            sys.stdout.write(f"{DIM}{text}{RESET}")
+            sys.stdout.flush()
+            live_line["open"] = True
+
+    def close_partial():
+        if live_line["open"]:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            live_line["open"] = False
+
+    try:
+        for chunk in utterances(sys.stdin, args.flush_after, show_partial):
+            if controls.quit:
+                break
+            if controls.paused:
+                continue     # 멈춘 동안 들어온 말은 버린다. 쌓아 두면 풀 때 한꺼번에 쏟아진다
+            with lock:
+                close_partial()
+            seq += 1
+            jobs.put((seq, chunk))
+        jobs.join()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        controls.restore()
+        jobs.put(None)
+        th.join(timeout=5)
+        if not args.no_save:
+            saved = save_log(transcript, ROOT)
+            if saved:
+                rel = saved.relative_to(ROOT) if saved.is_relative_to(ROOT) else saved
+                print(f"\n자막을 남겼습니다: {rel}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

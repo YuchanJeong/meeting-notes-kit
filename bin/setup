@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# 최초 1회 실행. 필요한 도구를 깔고 폴더와 설정 파일을 준비한다.
+set -eo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PATH_ORIG="$PATH"
+DROP="$HOME/Library/Mobile Documents/com~apple~CloudDocs/meeting-notes"
+
+echo "== 1. 전사 도구 설치 =="
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew가 없습니다. https://brew.sh 에서 먼저 설치해 주세요." >&2
+  exit 1
+fi
+brew list uv     >/dev/null 2>&1 || brew install uv
+brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+command -v whisperx >/dev/null 2>&1 || uv tool install whisperx
+
+echo
+echo "== 2. meeting 명령 설치 =="
+# 어느 폴더에서든 meeting 으로 부를 수 있게 ~/.local/bin 에 이어 둔다.
+mkdir -p "$HOME/.local/bin"
+LINK="$HOME/.local/bin/meeting"
+if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$ROOT/bin/meeting" ]; then
+  echo "이미 연결되어 있습니다: ~/.local/bin/meeting"
+else
+  ln -sf "$ROOT/bin/meeting" "$LINK"
+  echo "연결했습니다: ~/.local/bin/meeting -> bin/meeting"
+fi
+case ":$PATH_ORIG:" in
+  *":$HOME/.local/bin:"*)
+    echo "이제 어느 폴더에서든 'meeting' 을 쓸 수 있습니다." ;;
+  *)
+    echo
+    echo "참고: ~/.local/bin 이 PATH 에 없어 아직 'meeting' 으로 부를 수 없습니다."
+    echo "  아래 한 줄을 ~/.zshrc 에 더하고 터미널을 새로 여세요."
+    echo '    export PATH="$HOME/.local/bin:$PATH"' ;;
+esac
+
+echo
+echo "== 3. 아이폰 전달용 iCloud 폴더 =="
+mkdir -p "$DROP"
+echo "준비됨: iCloud Drive/meeting-notes"
+echo "아이폰 음성 메모에서 [공유] > [파일에 저장] 으로 이 폴더를 고르면 맥으로 넘어옵니다."
+
+echo
+echo "== 4. 설정 파일 =="
+if [ -f "$ROOT/.env" ]; then
+  echo "이미 있음: .env"
+else
+  cp "$ROOT/.env.example" "$ROOT/.env"
+  echo ".env를 만들었습니다. HF_TOKEN 값을 채워 주세요."
+fi
+
+echo
+echo "== 5. 설치 확인 =="
+if [ -d "$HOME/.local/bin" ]; then
+  PATH="$PATH:$HOME/.local/bin"
+fi
+if command -v whisperx >/dev/null 2>&1; then
+  echo "whisperx 실행 가능: $(command -v whisperx)"
+  case ":$PATH_ORIG:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      echo
+      echo "참고: ~/.local/bin 이 PATH에 없습니다."
+      echo "  bin/transcribe 는 이 경로를 스스로 찾으므로 그냥 쓰셔도 됩니다."
+      echo "  터미널에서 whisperx 를 직접 치고 싶다면 아래를 한 번 실행하고 터미널을 새로 여세요."
+      echo "    uv tool update-shell"
+      ;;
+  esac
+else
+  echo "whisperx를 찾지 못했습니다. 위 설치 단계의 오류를 확인해 주세요." >&2
+fi
+
+echo
+echo "== 6. 남은 수동 작업 =="
+cat <<'TXT'
+[ ] HuggingFace 토큰 발급 (read 권한) 후 .env의 HF_TOKEN에 입력
+[ ] pyannote/speaker-diarization-3.1 페이지에서 약관 동의
+[ ] pyannote/segmentation-3.0 페이지에서도 약관 동의
+    -> 이 세 가지를 빼먹으면 전사는 되는데 화자분리에서 401이 납니다.
+[ ] 온라인 회의용 Anarlog 설치 및 권한 허용 (README의 online 항목 참고)
+
+실시간 자막까지 쓰려면 아래도 필요합니다. 쓰지 않으면 건너뛰어도 됩니다.
+[ ] brew install blackhole-2ch   (시스템 오디오를 전사로 흘리는 가상 장치)
+[ ] meeting setup-audio          (스피커와 BlackHole 로 소리를 함께 보내는 장치 만들기)
+[ ] meeting prefetch             (전사·번역 모델과 whisper.cpp, Ollama 내려받기)
+TXT
