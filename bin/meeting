@@ -46,6 +46,29 @@ describe() {
 # 목록에 이미 적어 둔 명령들. 여기에 없는 것이 bin 에 생기면 아래에서 따로 붙인다.
 KNOWN="live import-iphone transcribe setup prefetch set-token setup-audio translate meeting_md selftest"
 
+# 아직 준비되지 않은 것만 짚어 준다. 무엇부터 해야 하는지가 순서보다 먼저다.
+todo=""
+need() { todo="$todo$(printf '  %-24s %s' "$1" "$2")
+"; }
+
+check_ready() {
+  [ -d "$HOME/.local/bin" ] && PATH="$PATH:$HOME/.local/bin"
+  command -v whisperx >/dev/null 2>&1 \
+    || need "meeting setup" "전사 도구가 아직 깔리지 않았습니다"
+  if [ -f "$ROOT/.env" ]; then
+    grep -q '^HF_TOKEN=..*' "$ROOT/.env" \
+      || need "meeting set-token" "화자분리에 쓸 토큰이 비어 있습니다"
+  else
+    need "meeting setup" ".env 가 아직 없습니다"
+  fi
+  command -v whisper-stream >/dev/null 2>&1 \
+    || need "brew install whisper-cpp" "실시간 전사에 필요합니다"
+  ls "$ROOT"/models/ggml-*.bin >/dev/null 2>&1 \
+    || need "meeting prefetch" "실시간 전사 모델이 아직 없습니다"
+  command -v ollama >/dev/null 2>&1 \
+    || need "brew install ollama" "실시간 번역에 필요합니다"
+}
+
 # 인자가 없을 때와 --help 는 같은 목록을 보여 준다
 case "${1:-}" in
   -h|--help) set -- ;;
@@ -53,35 +76,50 @@ esac
 
 if [ $# -eq 0 ]; then
   echo "meeting-notes: ${ROOT/#$HOME/~}"
+  check_ready
+
+  if [ -n "$todo" ]; then
+    echo
+    echo "▶ 먼저 할 일"
+    printf '%s' "$todo"
+    echo
+    echo "  자세한 안내는 README.md 의 '설치' 항목에 있습니다."
+  else
+    echo "준비가 모두 끝났습니다. 아래 순서대로 쓰시면 됩니다."
+  fi
+
   cat <<'TXT'
 
-■ 회의 중에 알아듣고 싶을 때 — 실시간 자막
-    meeting live            온라인 회의. 스피커로 나오는 영어를 한국어 자막으로
-    meeting live --mic      대면 회의. 마이크로 듣는 영어를 한국어 자막으로
-    meeting live --ko       한국어 회의를 받아 적기만 (번역하지 않음)
+① 처음 한 번만  — 맥을 바꾸거나 새로 받았을 때만 다시 합니다
+     meeting setup            도구 설치와 .env 만들기
+     meeting set-token        HuggingFace 토큰 넣기 (화자분리에 필요)
+     meeting prefetch         모델 미리 받기 (10GB, 오래 걸림)
+     meeting setup-audio      실시간 자막용 소리 장치 만들기
 
-  회의 중에 스페이스로 멈추고, q 로 끝냅니다. 끝내면 자막이 파일로 남습니다.
+② 회의 중  — 상대방 말을 한국어 자막으로 보기
+     meeting live             온라인 회의. 스피커로 나오는 영어를 자막으로
+     meeting live --mic       대면 회의. 마이크로 듣는 영어를 자막으로
+     meeting live --ko        한국어 회의를 받아 적기만 (번역하지 않음)
 
-■ 회의가 끝난 뒤 회의록이 필요할 때
+   회의 시작할 때 켜 두면 됩니다. 스페이스로 멈추고 q 로 끝냅니다.
+   자막은 기록용이 아닙니다. 회의록은 ③ 에서 따로 만듭니다.
 
-  온라인 회의는 Anarlog 앱이 전사와 요약까지 합니다.
-  내보낸 노트를 online/02-notes/ 에 두기만 하면 됩니다.
+③ 회의 후  — 회의록 남기기
 
-  대면 회의는 아이폰으로 녹음한 뒤 두 줄이면 됩니다.
-    meeting import-iphone   녹음을 offline/01-inbox 로 가져오기
-    meeting transcribe      화자별 회의록 만들기 (1시간 분량에 10~20분)
+   온라인 회의는 Anarlog 앱이 전사와 요약까지 합니다.
+   내보낸 노트를 online/02-notes/ 에 두기만 하면 끝입니다.
 
-■ 처음 한 번
-    meeting setup           도구 설치와 .env 만들기
-    meeting prefetch        모델 미리 받기 (10GB, 오래 걸림)
-    meeting set-token       HuggingFace 토큰 넣기 (화자분리에 필요)
-    meeting setup-audio     실시간 자막용 소리 장치 만들기
+   대면 회의는 아이폰으로 녹음한 뒤 세 단계입니다.
+     1) meeting import-iphone           녹음을 offline/01-inbox 로 가져온다
+     2) meeting transcribe              회의록을 만든다 (1시간 분량에 10~20분)
+     3) offline/03-notes/ 의 회의록을 열어 누가 누구인지 확인하고 이름을 붙인다
+        meeting transcribe 주간회의.m4a --names SPEAKER_00=이우성 SPEAKER_01=김팀장
+        (전사는 다시 하지 않고 이름만 바꾸므로 몇 초면 끝납니다)
 
-■ 그 밖
-    meeting translate       영어 글을 한국어로 옮긴다
-                            예: pbpaste | meeting translate
-    meeting meeting_md      전사 JSON 을 회의록 마크다운으로
-    meeting selftest        스크립트를 고친 뒤 회귀 점검
+그 밖
+     meeting translate        영어 글을 한국어로 (예: pbpaste | meeting translate)
+     meeting meeting_md       전사 JSON 을 회의록 마크다운으로
+     meeting selftest         스크립트를 고친 뒤 회귀 점검
 TXT
 
   # 위에 적지 않은 명령이 bin 에 생겼다면 빠뜨리지 않고 덧붙인다.
@@ -95,9 +133,9 @@ TXT
   done
   if [ -n "$extra" ]; then
     echo
-    echo "■ 목록에 아직 적지 않은 명령"
+    echo "목록에 아직 적지 않은 명령"
     for base in $extra; do
-      printf '    meeting %-14s %s\n' "$base" "$(describe "$base")"
+      printf '     meeting %-16s %s\n' "$base" "$(describe "$base")"
     done
   fi
 
